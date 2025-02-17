@@ -230,12 +230,11 @@ class LDoSPlot:
 
 
 def dI_dV(energies, states, T:float, deltaV:float):
-    beta = 1 / T
-    half_beta = 0.5 * beta
-    STM_weight = lambda e: (1.0 - np.tanh(half_beta * (e - deltaV))**2)
+    STM_weight = lambda e, E0, T: 1 - np.tanh((0.5 / T) * (e - E0))**2
 
+    ws = STM_weight(energies, dV, T)
     n_sites = states.shape[0]
-    dIdV = (1 / n_sites) * np.sum(states**2 * STM_weight(energies), axis=1)
+    dIdV = (1 / n_sites) * np.sum(states[::2]**2 * ws, axis=1)
     return dIdV
 
 
