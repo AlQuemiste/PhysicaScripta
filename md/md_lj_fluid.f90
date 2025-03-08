@@ -1,31 +1,41 @@
 module MolecularDynamics
-    use, intrinsic :: iso_c_binding, only: c_double, c_int
-    implicit none
+  use, intrinsic :: iso_c_binding, only: c_double, c_int
+  implicit none
 
-    ! double precision kind parameter
-    integer, parameter :: f64 = selected_real_kind(c_double)
-    integer, parameter :: i32 = selected_int_kind(c_int)
+  ! double precision kind parameter
+  integer, parameter :: f64 = selected_real_kind(c_double)
+  integer, parameter :: i32 = selected_int_kind(c_int)
 
-    ! assumed to be defined elsewhere in the module
-    integer(kind=i32) :: n_particles  ! total number of particles
-    real(kind=f64) :: T  ! temperature
+  ! assumed to be defined elsewhere in the module
+  real(kind=f64), parameter :: EPS = 1.0E-10
+  integer(kind=i32) :: n_particles  ! total number of particles
+  real(kind=f64) :: T  ! temperature
 
-    real(kind=f64), allocatable :: state(:, :)
-    integer, allocatable :: fixedParticles(:)
-    integer, allocatable :: boundParticles(:, 2)
+  type, bind(C) :: Parameters
+     integer(i32) :: thermalization  ! nr of warm-up steps
+     integer(i32) :: steps           ! nr of MC steps
+     integer(i32) :: j               ! J / |J| = +-1, the sign of the spin coupling, J
+     ! +: ferromagnetic coupling, -: antiferromagnetic coupling
+     real(f64) :: t               ! T / |J|, temperature in units of J
+     real(f64) :: beta            ! 1 / (T/|J|), inverse temperature in units of J
+     real(f64) :: h               ! h / |J|, external magnetic field in units of J
+     integer(i32) :: L               ! linear dimension of the lattice
+  end type Parameters
 
 contains
 
-  subroutine step(dt, prm, fixedParticles, boundParticles, state)
+  subroutine step(dt, prm, fixedParticles, boundParticles, state, stat)
     real(f64), intent(in) :: dt
     type(Parameters), intent(in) :: prm
     real(f64), dimension(:), intent(in) :: fixedParticles
     real(f64), dimension(:, 2), intent(in) :: boundParticles
     real(f64), dimension(prm%n_conf, :), intent(inout), target :: state
+    type(Statistics), intent(out) :: stat
+
     integer, parameter :: n_particles = size(state, 2)
     real(f64), dimension(n_particles), pointer :: X, Y, VX, VY, AX, AY
     real(f64) :: half_dt, half_dt2
-    integer :: iP, iFx
+    integer :: iP
 
     !! velocity Verlet algorithm
 
@@ -55,7 +65,7 @@ contains
     end do
 
     ! compute accelerations
-    call compute_accelerations(prm, boundParticles, X, Y, AX, AY)
+    call compute_accelerations(prm, boundParticles, X, Y, AX, AY, stat)
 
     ! second half of velocity update
     do iP = 1, n_particles
@@ -64,35 +74,27 @@ contains
     end do
 
     ! force zero velocity for fixed particles
-    do iFx = 1, size(fixedParticles)
-       VX(iFx) = 0.0D0
-       VY(iFx) = 0.0D0
+    do iP = 1, size(fixedParticles)
+       VX(iP) = 0.0D0
+       VY(iP) = 0.0D0
     end do
   end subroutine step
 
 
-  subroutine wallForce(prm, X, Y, AX, AY, pressure)
+  subroutine singleParticleForces(prm, X, Y, AX, AY, stat)
     type(Parameters), intent(in) :: prm
     real(f64), dimension(:), intent(in) :: X, Y
     integer, parameter :: n_particles = size(X)
     real(f64), dimension(:), intent(inout) :: AX, AY
-    real(f64), intent(out) :: pressure
+    type(Statistics), intent(out) :: stat
 
-    real(f64) :: half_wallThickness, UWall, wallForce, U_w, A_w
-
-    ! walls
-    wallThickness = 0.5D0   ! in units of sigma
-    half_wallThickness = 0.5D0 * wallStiffness
-    wallStiffness = 50.D0   ! in units of sigma^2
-    wallLim = boxWidth - wallThickness
-    wallUc = 0.5 * wallStiffness * wallThickness * wallThickness
+    real(f64) :: wallForce_tot
 
     ! box area
     boxArea = 4.0D0 * boxWidth
 
     ! UWall = 0.0D0
-    wallForce = 0.0D0
-    pressure = 0.0D0
+    wallForce_tot = 0.0D0
 
     ! TODO: use do concurrent
     ! check for bounces off walls and apply wall forces
@@ -100,52 +102,65 @@ contains
        AX(iP) = 0.0D0
        AY(iP) = 0.0D0
 
-       ! wall interactions on x-axis
-       call wallForce1d(X(iP), A_w)
-       AX(iP) = A_w
-       wallForce = wallForce + A_w
-       ! UWall = UWall + U_w
+       ! apply gravity (constant force)
+       AY(iP) = AY(iP) - prm%gGravity
 
-       ! wall interactions on y-axis
-       call wallForce1d(Y(iP), A_w)
-       AY(iP) = A_w
-       wallForce = wallForce + A_w
-       ! UWall = UWall + U_w
+       wallForce_tot = wallForce_tot + wallForce(X(iP), Y(iP))
     end do
 
     ! calculate instantaneous pressure on walls
-    pressure = wallForce / prm%boxArea
+    stat%pressure = wallForce_tot / prm%boxArea
 
   contains
 
-    subroutine wallForce1d(rP, A_w)
-      real(f64), intent(in) :: rP
-      real(f64), intent(out) :: A_w
+    function wallForce(x_i, y_i, ai_x, ai_y)
 
-      real(f64) :: dist, wallLim
+      real(f64), intent(in) :: x_i, y_i
+      real(f64), intent(out) :: ai_x, ai_y
+      real(f64) :: wallForce
 
-      wallLim = prm%boxWidth - prm%wallThickness
-      A_w = 0.0D0
-      ! U_w = 0.0D0
+      ! wall interactions on x-axis
+      call wallForce1d(x_i, ai_x)
+      wallForce = wallForce + ai_x
+      ! UWall = UWall + U_w
 
-      ! apply wall force
+      ! wall interactions on y-axis
+      call wallForce1d(y_i, ai_y)
+      wallForce = wallForce + ai_y
+      ! UWall = UWall + U_w
 
-      ! CHECK
-      if (rP < prm%wallThickness) then
-         dist = prm%wallThickness - rP   ! > 0
-         A_w = prm%wallStiffness * dist  ! positive
-         ! U_w = 0.5D0 * A_w * dist - prm%U_wc
-      else if (rP > wallLim) then
-         dist = wallLim - rP         ! < 0
-         A_w = wallStiffness * dist  ! negative
-         ! U_w = 0.5D0 * A_w * dist - prm%U_wc
-      end if
-    end subroutine wallForce1d
+    contains
 
-  end subroutine wallForce
+      subroutine wallForce1d(rP, A_w)
+        real(f64), intent(in) :: rP
+        real(f64), intent(out) :: A_w
+
+        real(f64) :: dist, wallLim
+
+        wallLim = prm%boxWidth - prm%wallThickness
+        A_w = 0.0D0
+        ! U_w = 0.0D0
+
+        ! apply wall force
+
+        ! CHECK
+        if (rP < prm%wallThickness) then
+           dist = prm%wallThickness - rP   ! > 0
+           A_w = prm%wallStiffness * dist  ! positive
+           ! U_w = 0.5D0 * A_w * dist - prm%U_wc
+        else if (rP > wallLim) then
+           dist = wallLim - rP         ! < 0
+           A_w = wallStiffness * dist  ! negative
+           ! U_w = 0.5D0 * A_w * dist - prm%U_wc
+        end if
+      end subroutine wallForce1d
+
+    end function wallForce
+
+  end subroutine singleParticleForces
 
 
-  subroutine LennardJonesForce(prm, X, Y, AX, AY)
+  subroutine twoParticleForce(prm, X, Y, AX, AY)
     type(Parameters), intent(in) :: prm
     real(f64), dimension(:), intent(in) :: X, Y
     integer, parameter :: n_particles = size(X)
@@ -168,37 +183,56 @@ contains
        do jP = 1, iP - 1
           dx = X(iP) - X(jP)
           dx2 = dx * dx
+          if (dx2 >= prm%rC_LJ2) cycle
 
           dy = Y(iP) - Y(jP)
           dy2 = dy * dy
+          if (dy2 >= prm%rC_LJ2) cycle
 
           r2 = dx2 + dy2
+          if (r2 >= prm%rC_LJ2) cycle
 
-          if (r2 >= prm%rC_LJ2) continue
+          call LennardJones2P(X(iP), Y(iP), X(jP), Y(jP), ai_x, ai_y)
 
-          ! r2 < rC_LJ2
-          r2Inv = 1.0D0 / r2
-          attract = r2Inv * r2Inv * r2Inv  ! = 1 / r^6
-          repel = attract * attract        ! = 1 / r^12
+          ! force on i from j
+          AX(iP) = AX(iP) + ai_x
+          AY(iP) = AY(iP) + ai_y
 
-          ! U_LJ = U_LJ + (4.0D0 * (repel - attract)) - prm%UC_LJ
-
-          Fi_from_j = 24.0D0 * (2.0D0 * repel - attract) * r2Inv
-
-          fx = Fi_from_j * dx
-          fy = Fi_from_j * dy
-
-          ! Force on i from j
-          AX(iP) = AX(iP) + fx
-          AY(iP) = AY(iP) + fy
-
-          ! Force on j from i
-          AX(jP) = AX(jP) - fx
-          AY(jP) = AY(jP) - fy
+          ! force on j from i
+          AX(jP) = AX(jP) - ai_x
+          AY(jP) = AY(jP) - ai_y
        end do
     end do
 
-  end subroutine LennardJonesForce
+  contains
+
+    subroutine LennardJones2P(prm, x_i, y_i, x_j, y_j, ai_x, ai_y)
+      type(Parameters), intent(in) :: prm
+      real(f64), intent(in) :: x_i, y_i, x_j, y_j
+      real(f64), intent(out) :: ai_x, ai_y
+
+      ! r_c for Lennard-Jones potential (in units of sigma)
+      rC_LJ = 3.0D0
+      rC_LJ2 = rC_LJ * rC_LJ
+      ! U_c for Lennard-Jones potential (in units of epsilon)
+      UC_LJ = 4.0D0 * (1.0D0 / (rC_LJ**12 + EPS) - 1.0D0 / (rC_LJ**6 + EPS))
+
+      ! U_LJ = 0.0D0
+
+      ! r2 < rC_LJ2
+      r2Inv = 1.0D0 / (r2 + EPS)
+      attract = r2Inv * r2Inv * r2Inv  ! = 1 / r^6
+      repel = attract * attract        ! = 1 / r^12
+
+      ! U_LJ = U_LJ + (4.0D0 * (repel - attract)) - prm%UC_LJ
+
+      Fi_from_j = 24.0D0 * (2.0D0 * repel - attract) * r2Inv
+
+      ai_x = Fi_from_j * dx
+      ai_y = Fi_from_j * dy
+    end subroutine LennardJones2P
+
+  end subroutine twoParticleForce
 
 
   subroutine bondForce(prm, boundParticles, X, Y, AX, AY)
@@ -223,9 +257,9 @@ contains
 
        dx = X(iP) - X(jP)
        dy = Y(iP) - Y(jP)
-       r_ = sqrt(dx * dx + dy * dy)
-       dR = r_ - prm%R0
-       F0 = prm%bondStrength * dR / r_
+       rr = sqrt(dx * dx + dy * dy)
+       dR = rr - prm%R0
+       F0 = prm%bondStrength * dR / (rr + EPS)
 
        ! UBond = UBond + 0.5D0 * F0 * dR
 
@@ -242,30 +276,46 @@ contains
   end subroutine bondForce
 
 
-  subroutine compute_accelerations(prm, boundParticles, X, Y, AX, AY, pressure)
+  subroutine compute_accelerations(prm, boundParticles, X, Y, AX, AY, stat)
     type(Parameters), intent(in) :: prm
     real(f64), dimension(:, 2), intent(in) :: boundParticles
     real(f64), dimension(:), intent(in) :: X, Y
     integer, parameter :: n_particles = size(X)
     real(f64), dimension(:), intent(inout) :: AX, AY
-    real(f64), intent(out) :: pressure
+    type(Statistics), intent(out) :: stat
 
-    integer :: iP
+    ! apply single-particle forces
+    call singleParticleForces(prm, X, Y, AX, AY, stat)
 
-    ! apply gravity (constant force)
-    do iP = 1, n_particles
-       AY(iP) = AY(iP) - prm%gGravity
-    end do
-
-    ! apply wall forces
-    call wallForce(prm, X, Y, AX, AY, pressure)
+    ! apply two-particle forces
+    call twoParticleForces(prm, X, Y, AX, AY, stat)
 
     ! apply elastic forces between bonded particles
     call bondForce(prm, boundParticles, X, Y, AX, AY)
-
-    ! Lennard-Jones force
-    call LennardJonesForce(prm, X, Y, AX, AY)
   end subroutine compute_accelerations
+
+
+  subroutine statistics(prm, X, Y, VX, VY, stat)
+    real(f64), dimension(:), intent(in) :: X, Y, VX, VY
+    integer, parameter :: n_particles = size(X)
+    type(Statistics), intent(inout) :: stat
+
+    integer :: iP
+
+    ! reset statistical accumulators
+    stat%kineticE = 0.0D0
+
+    ! kinetic energy
+    do iP = 1, n_particles
+       ! K = 0.5 * v^2
+       stat%kineticE = stat%kineticE + 0.5D0 * (VX(iP) * VX(iP) + VY(iP) * VY(iP))
+    end do
+
+    ! current temperature
+    stat%currentT = stat%kineticE / real(n_particles - prm%n_fixed, f64)
+
+    ! TODO: calculate avg. polarization
+  end subroutine statistics
 
 
   subroutine BoxMuller()
@@ -302,26 +352,5 @@ contains
     end do
 
   end subroutine BoxMuller
-
-
-  subroutine statistics(prm, X, Y, VX, VY, stat)
-    real(f64), dimension(:), intent(in) :: X, Y, VX, VY
-    integer, parameter :: n_particles = size(X)
-    type(Statistics), intent(inout) :: stat
-
-    integer :: iP
-
-    ! reset statistical accumulators
-    stat%kineticE = 0.0D0
-
-    ! kinetic energy
-    do iP = 1, n_particles
-       ! K = 0.5 * v^2
-       stat%kineticE = stat%kineticE + 0.5D0 * (VX(iP) * VX(iP) + VY(iP) * VY(iP))
-    end do
-
-    ! current temperature
-    stat%currentT = stat%kineticE / real(n_particles - prm%n_fixed, f64)
-  end subroutine stats
 
 end module MolecularDynamics
